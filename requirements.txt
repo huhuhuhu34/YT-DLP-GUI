@@ -1,0 +1,7 @@
+# ---- YT-DLP GUI 运行依赖（Python 3.10+ / Windows）----
+yt-dlp>=2024.12.13
+PySide6>=6.8
+pycryptodomex>=3.21
+
+# ---- 打包用（可选，仅构建 exe 时需要）----
+# pyinstaller>=6.10
