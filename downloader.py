@@ -24,6 +24,8 @@ from typing import Callable, Optional
 import yt_dlp
 from yt_dlp.utils import DownloadCancelled  # yt-dlp 官方提供的“取消下载”异常
 
+import ytdlp_cli  # 外部 yt-dlp.exe 命令行后端（界面手动指定 exe 时启用）
+
 # 浏览器界面显示名 -> yt-dlp cookiesfrombrowser 内部名称
 BROWSER_MAP = {
     "Chrome": "chrome",
@@ -41,6 +43,12 @@ FORMAT_AUDIO_ONLY = "bestaudio/best"
 
 # yt-dlp 输出文件名模板
 OUTTMPL = "%(title)s [%(id)s].%(ext)s"
+
+try:
+    # 内置 yt_dlp 库版本号（界面“后端状态”需要显示）
+    YTDLP_VERSION = yt_dlp.version.__version__
+except Exception:
+    YTDLP_VERSION = "?"
 
 # 回调类型别名
 LogCB = Callable[[str, str], None]
@@ -127,6 +135,69 @@ def find_ffmpeg() -> Optional[str]:
                 if found:
                     return found
     return None
+
+
+def resolve_ffmpeg(preferred: Optional[str] = None) -> Optional[str]:
+    """定位 ffmpeg：手动指定的 exe 优先，其次才走自动检测。
+
+    手动路径无效（文件不存在/被删）时静默回退自动检测，不抛异常。
+    返回可执行文件完整路径，找不到返回 None。
+    """
+    if preferred and os.path.isfile(preferred):
+        return os.path.abspath(preferred)
+    return find_ffmpeg()
+
+
+def browser_profile_roots(browser_display: str) -> list:
+    """返回某浏览器存放 Profile 的根目录（Windows；目录存在才返回）。
+
+    Chrome / Edge / Brave / Vivaldi 返回其 User Data 目录；
+    Firefox 返回其 Profiles 目录；Opera 与未知名称返回空列表。
+    """
+    name = BROWSER_MAP.get(browser_display or "", "")
+    if not name:
+        return []
+    local = os.environ.get("LOCALAPPDATA") or ""
+    appdata = os.environ.get("APPDATA") or ""
+    rel = {
+        "chrome": (local, "Google", "Chrome", "User Data"),
+        "edge": (local, "Microsoft", "Edge", "User Data"),
+        "brave": (local, "BraveSoftware", "Brave-Browser", "User Data"),
+        "vivaldi": (local, "Vivaldi", "User Data"),
+        "firefox": (appdata, "Mozilla", "Firefox", "Profiles"),
+    }.get(name)
+    if not rel or not rel[0]:
+        return []
+    root = os.path.join(rel[0], *rel[1:])
+    return [root] if os.path.isdir(root) else []
+
+
+def list_browser_profiles(browser_display: str) -> list:
+    """扫描已安装的浏览器 Profile 目录，返回存在的绝对路径列表。
+
+    Chrome 系：User Data 下名为 Default 或以 "Profile " 开头的目录
+    （排除 Guest Profile / System Profile 等系统目录）；
+    Firefox：Profiles 目录下的所有子目录（形如 xxx.default-release）；
+    Opera 不支持 Profile —— 恒返回空列表。
+    """
+    name = BROWSER_MAP.get(browser_display or "", "")
+    if name == "opera":
+        return []
+    found: list = []
+    for root in browser_profile_roots(browser_display):
+        try:
+            entries = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            if entry in ("Guest Profile", "System Profile", "Default Apps"):
+                continue
+            path = os.path.join(root, entry)
+            if not os.path.isdir(path):
+                continue
+            if name == "firefox" or entry == "Default" or entry.startswith("Profile "):
+                found.append(path)
+    return found
 
 
 def make_cookies_cfg(browser_display: str, profile: str) -> Optional[tuple]:
@@ -331,12 +402,17 @@ def _base_ydl_opts(cookies_cfg, log_cb: Optional[LogCB]) -> dict:
 
 
 def parse_url(url: str, cookies_cfg=None, noplaylist: bool = False,
-              log_cb: Optional[LogCB] = None) -> dict:
+              log_cb: Optional[LogCB] = None,
+              ytdlp_exe: Optional[str] = None) -> dict:
     """解析 URL（不下载任何文件），返回界面所需信息。
 
     返回字典：url / title / uploader / duration / webpage_url /
               is_playlist / playlist_count / formats(describe_formats 结果)
+    当 ytdlp_exe 指向有效的 yt-dlp.exe 时，改用该外部可执行文件解析。
     """
+    if ytdlp_exe and os.path.isfile(ytdlp_exe):
+        return ytdlp_cli.parse_url_external(ytdlp_exe, url, cookies_cfg=cookies_cfg,
+                                            noplaylist=noplaylist, log_cb=log_cb)
     if log_cb:
         log_cb("info", f"开始解析链接：{url}")
     opts = _base_ydl_opts(cookies_cfg, log_cb)
@@ -410,13 +486,29 @@ def run_download_queue(
     cancel_event: Optional[threading.Event] = None,
     log_cb: Optional[LogCB] = None,
     progress_cb: Optional[ProgressCB] = None,
+    ytdlp_exe: Optional[str] = None,
+    ffmpeg_exe: Optional[str] = None,
 ) -> dict:
     """依次下载批量队列。返回统计结果字典 {'total','success','failed','cancelled'}。
 
     注意：本函数在后台线程运行；主线程通过置位 cancel_event 请求取消。
+    当 ytdlp_exe 指向有效的 yt-dlp.exe 时，整条队列自动切换到外部命令行后端；
+    ffmpeg_exe 为界面手动指定的 ffmpeg（优先于自动检测）。
     """
     if not urls:
         raise ValueError("下载队列为空")
+
+    if ytdlp_exe and os.path.isfile(ytdlp_exe):
+        # 手动指定外部 yt-dlp.exe → 整条队列交给命令行后端处理
+        return ytdlp_cli.run_download_queue_external(
+            ytdlp_exe, urls, output_dir, fmt_expression,
+            cookies_cfg=cookies_cfg,
+            noplaylist=noplaylist,
+            ffmpeg_exe=ffmpeg_exe,
+            cancel_event=cancel_event,
+            log_cb=log_cb,
+            progress_cb=progress_cb,
+        )
 
     # 输出目录不存在则自动创建
     try:
@@ -429,10 +521,12 @@ def run_download_queue(
         log_cb("info", f"输出目录：{output_dir}")
         log_cb("info", f"清晰度/格式表达式：{fmt_expression}")
 
-    ffmpeg_path = find_ffmpeg()
+    # ffmpeg：界面手动指定的优先，否则自动检测（PATH / winget / exe 同目录）
+    ffmpeg_path = resolve_ffmpeg(ffmpeg_exe)
     if log_cb:
         if ffmpeg_path:
-            log_cb("info", f"已检测到 ffmpeg：{ffmpeg_path}")
+            src = "手动指定" if ffmpeg_exe else "自动检测"
+            log_cb("info", f"已检测到 ffmpeg（{src}）：{ffmpeg_path}")
         else:
             log_cb("warning",
                    "未检测到 ffmpeg：需要“合并音视频”的清晰度将失败。请安装 ffmpeg："

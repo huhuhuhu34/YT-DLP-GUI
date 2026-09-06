@@ -9,6 +9,7 @@
 | `main.py` | 程序入口 + 主界面（PySide6）|
 | `worker.py` | QThread 后台任务封装（Worker + 信号）|
 | `downloader.py` | yt-dlp 下载逻辑封装（不依赖 Qt）|
+| `ytdlp_cli.py` | 外部 yt-dlp.exe 命令行后端（界面手动指定 exe 时启用）|
 | `make_icon.py` | 图标生成脚本（需 PySide6，重跑可换图标）|
 | `assets/` | 图标产物：`app.ico`（exe 用）、`app_icon.png`（窗口/任务栏用）|
 | `requirements.txt` | 从源码运行时需要的 Python 依赖 |
@@ -41,6 +42,21 @@ winget install Gyan.FFmpeg
 **验证**：新开命令行执行 `ffmpeg -version`；然后启动程序，顶部横幅显示绿色“✓ ffmpeg 已就绪”即完成。
 
 > 提示：不装 ffmpeg 也能下载“单文件已含音轨”的格式或纯音频，但默认的“最佳画质（自动合并）”与高清“仅视频流”选项会失败。
+
+### （可选）手动指定 yt-dlp.exe / ffmpeg.exe
+
+默认行为：程序**内置** yt-dlp Python 库（版本随 exe 一起打包），ffmpeg 自动检测（系统 PATH / winget 安装目录 / 本程序 exe 同目录）。如果不想等程序更新也想用新版 yt-dlp，或把 ffmpeg 放在了自定义目录，可在界面中部的「**外部程序路径（可选）**」区域手动指定：
+
+- **yt-dlp.exe**：点“浏览…”选择官网下载的 `yt-dlp.exe`（单文件便携版）。保存后“解析”和“下载”都会改用调用该 exe 完成（命令行模式），其版本显示在下方状态行；点“恢复内置”即回到随程序打包的版本。
+- **ffmpeg.exe**：点“浏览…”选择 `ffmpeg.exe`（**须与 ffprobe.exe 位于同一目录**）。指定后优先于自动检测，顶部横幅会标注其来源；点“自动检测”即可还原。
+
+几点说明：
+
+- 中文文件名 / 中文路径完全受支持：外部 yt-dlp 的输出会按 UTF-8 / GBK 自动识别解码，日志与进度里的中文标题不会乱码。
+- 手动指定的路径会被记住，下次启动自动恢复；若文件已被删除会回退默认并提示。
+- 命令行模式的进度来自逐行解析 yt-dlp 输出，精度略低于内置库（断点续传、分片并发等下载行为不变）。
+- 下载中“取消”会直接结束外部 yt-dlp 进程；配合断点续传，已下载的分片不会丢失。
+- 下载/解析任务运行期间这两个路径的按钮会置灰，避免任务中变更参数。
 
 ---
 
@@ -103,4 +119,8 @@ python main.py
 ## 其他说明
 
 - “No Playlist”默认勾选：链接带 `list` 参数时只下载当前视频；取消勾选则整张播放列表依次下载。
-- Cookies 来源选 Chrome/Edge/Firefox 等后会自动读取对应浏览器 Cookie（可选填 Profile 名）；若浏览器 Cookie 库被占用而失败，请先完全关闭浏览器重试。
+- Cookies 来源选 Chrome/Edge/Firefox 等后会自动读取对应浏览器 Cookie。选择来源后界面会：
+  - **自动列出**该浏览器已安装的 Profile 目录供选择（Chrome/Edge/Brave/Vivaldi 的 `User Data\Default`、Firefox `Profiles\*.default*` 等，包含中文名的 Profile 亦可正常显示）；
+  - 提示该浏览器 Profile 通常放在哪里；找不到时可用下拉末尾的“**手动选择 Profile 目录…**”浏览指定；
+  - 也可直接手动输入 Profile 名或完整路径；留空 = 自动使用默认 Profile（**Opera 不支持 Profile**，选择 Opera 时该栏禁用）。
+  若浏览器 Cookie 库被占用而读取失败，请先彻底关闭浏览器再重试。

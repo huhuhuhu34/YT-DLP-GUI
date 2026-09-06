@@ -36,14 +36,18 @@ from PySide6.QtWidgets import (
 from downloader import (
     FORMAT_AUDIO_ONLY,
     FORMAT_AUTO_BEST,
-    find_ffmpeg,
+    YTDLP_VERSION,
+    browser_profile_roots,
+    list_browser_profiles,
     format_duration,
     human_bytes,
     make_cookies_cfg,
     parse_url,
+    resolve_ffmpeg,
     run_download_queue,
 )
 from worker import Worker
+from ytdlp_cli import get_ytdlp_version
 
 FFMPEG_DOWNLOAD_URL = "https://www.gyan.dev/ffmpeg/builds/"
 BROWSER_CHOICES = ["不使用", "Chrome", "Edge", "Firefox", "Brave", "Opera", "Vivaldi"]
@@ -87,13 +91,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("YT-DLP 批量下载器")
-        self.resize(920, 780)
+        self.resize(920, 900)
 
         self.settings = QSettings("YT-DLP-GUI", "YT-DLP-GUI")
         self._thread: QThread | None = None      # 当前后台线程（同一时刻只允许一个任务）
         self._worker: Worker | None = None
         self._cancel_event: threading.Event | None = None
         self._busy = False
+        self._ytdlp_ver_cache: dict = {}         # exe 路径 -> 已探测到的 yt-dlp 版本号
 
         # 窗口/任务栏图标（图标缺失时静默跳过，不影响启动）
         _ico = icon_path()
@@ -102,6 +107,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._restore_settings()
+        self._update_backend_status()
         self._update_ffmpeg_status()
         self._set_busy(False)
         self.append_log("info", "程序就绪：粘贴链接 → 解析 → 选清晰度 → 开始下载。")
@@ -191,12 +197,71 @@ class MainWindow(QMainWindow):
         self.cookieCombo = QComboBox()
         self.cookieCombo.addItems(BROWSER_CHOICES)
         ck_row.addWidget(self.cookieCombo)
-        self.profileEdit = QLineEdit()
-        self.profileEdit.setPlaceholderText("浏览器 Profile 名（留空=默认，如 Profile 1）")
+        self.profileCombo = QComboBox()
+        self.profileCombo.setEditable(True)
+        self.profileCombo.setInsertPolicy(QComboBox.NoInsert)
+        self.profileCombo.setMinimumContentsLength(26)
+        self.profileCombo.setToolTip(
+            "选择已检测到的浏览器 Profile 目录；也可直接输入 Profile 名，"
+            "或选择“手动选择 Profile 目录…”。留空 = 自动使用默认 Profile。")
         ck_row.addWidget(QLabel("Profile:"))
-        ck_row.addWidget(self.profileEdit, 1)
+        ck_row.addWidget(self.profileCombo, 1)
         root.addLayout(ck_row)
         self.cookieCombo.currentIndexChanged.connect(self._on_cookie_changed)
+        self.profileCombo.activated.connect(self._on_profile_activated)
+
+        # Profile 位置提示：选择 Cookies 来源后提示去哪找，其余时间隐藏
+        self.profileHint = QLabel("")
+        self.profileHint.setWordWrap(True)
+        self.profileHint.setTextFormat(Qt.RichText)
+        self.profileHint.setStyleSheet("color:#6b7280;font-size:9pt;")
+        self.profileHint.hide()
+        root.addWidget(self.profileHint)
+
+        # —— 外部程序路径（可选）：留空 = 自动检测 / 使用内置 yt-dlp ——
+        ext_group = QGroupBox("外部程序路径（可选，留空则自动）")
+        ext_v = QVBoxLayout(ext_group)
+
+        row_yd = QHBoxLayout()
+        row_yd.addWidget(QLabel("yt-dlp.exe:"))
+        self.ytdlpEdit = QLineEdit()
+        self.ytdlpEdit.setReadOnly(True)
+        self.ytdlpEdit.setPlaceholderText(
+            "留空 = 使用打包内置的 yt-dlp 库；填此路径后解析/下载将调用该 exe（适合自备新版）")
+        row_yd.addWidget(self.ytdlpEdit, 1)
+        self.ytdlpBrowseBtn = QPushButton("浏览…")
+        self.ytdlpBrowseBtn.setToolTip("选择官网下载的 yt-dlp.exe（独立可执行文件）")
+        self.ytdlpBrowseBtn.clicked.connect(self._on_browse_ytdlp)
+        row_yd.addWidget(self.ytdlpBrowseBtn)
+        self.ytdlpClearBtn = QPushButton("恢复内置")
+        self.ytdlpClearBtn.setToolTip("清空设置，回到打包内置的 yt-dlp 库")
+        self.ytdlpClearBtn.clicked.connect(lambda: self._set_ytdlp_exe(""))
+        row_yd.addWidget(self.ytdlpClearBtn)
+        ext_v.addLayout(row_yd)
+
+        row_ff = QHBoxLayout()
+        row_ff.addWidget(QLabel("ffmpeg.exe:"))
+        self.ffmpegEdit = QLineEdit()
+        self.ffmpegEdit.setReadOnly(True)
+        self.ffmpegEdit.setPlaceholderText(
+            "留空 = 自动检测（系统 PATH / winget 安装目录 / 本程序 exe 同目录）")
+        row_ff.addWidget(self.ffmpegEdit, 1)
+        self.ffmpegBrowseBtn = QPushButton("浏览…")
+        self.ffmpegBrowseBtn.setToolTip("选择 ffmpeg.exe（应与 ffprobe.exe 位于同一目录）")
+        self.ffmpegBrowseBtn.clicked.connect(self._on_browse_ffmpeg)
+        row_ff.addWidget(self.ffmpegBrowseBtn)
+        self.ffmpegClearBtn = QPushButton("自动检测")
+        self.ffmpegClearBtn.setToolTip("清空设置，回到自动检测")
+        self.ffmpegClearBtn.clicked.connect(lambda: self._set_ffmpeg_exe(""))
+        row_ff.addWidget(self.ffmpegClearBtn)
+        ext_v.addLayout(row_ff)
+
+        self.backendStatusLabel = QLabel("")
+        self.backendStatusLabel.setWordWrap(True)
+        self.backendStatusLabel.setTextFormat(Qt.RichText)
+        self.backendStatusLabel.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        ext_v.addWidget(self.backendStatusLabel)
+        root.addWidget(ext_group)
 
         # —— 进度条与状态文本 ——
         self.progressBar = QProgressBar()
@@ -257,8 +322,24 @@ class MainWindow(QMainWindow):
             idx = 0
         if 0 <= idx < self.cookieCombo.count():
             self.cookieCombo.setCurrentIndex(idx)
-        self.profileEdit.setText(str(self.settings.value("cookie_profile", "") or ""))
-        self._on_cookie_changed()
+        self._on_cookie_changed()   # 重建 Profile 候选并更新提示
+        if self.cookieCombo.currentIndex() > 0:
+            # 上一步刚被 _on_cookie_changed 清空，这里再恢复保存的 Profile 值
+            self._apply_profile(str(self.settings.value("cookie_profile", "") or ""))
+
+        # 外部程序路径（手动指定的 yt-dlp.exe / ffmpeg.exe）
+        yt_exe = str(self.settings.value("ytdlp_exe_path", "") or "").strip()
+        if yt_exe and not os.path.isfile(yt_exe):
+            self.append_log("warning",
+                            f"上次指定的 yt-dlp.exe 已不存在，已恢复内置后端：{yt_exe}")
+            yt_exe = ""
+        ff_exe = str(self.settings.value("ffmpeg_exe_path", "") or "").strip()
+        if ff_exe and not os.path.isfile(ff_exe):
+            self.append_log("warning",
+                            f"上次指定的 ffmpeg.exe 已不存在，已恢复自动检测：{ff_exe}")
+            ff_exe = ""
+        self.ytdlpEdit.setText(yt_exe)
+        self.ffmpegEdit.setText(ff_exe)
 
         # 恢复窗口大小
         geo = self.settings.value("geometry")
@@ -280,13 +361,107 @@ class MainWindow(QMainWindow):
             self._thread.wait(10_000)   # 给取消逻辑一点收尾时间
         self.settings.setValue("output_dir", self.outDirEdit.text().strip())
         self.settings.setValue("cookie_index", self.cookieCombo.currentIndex())
-        self.settings.setValue("cookie_profile", self.profileEdit.text())
+        self.settings.setValue("cookie_profile", self._profile_value())
+        self.settings.setValue("ytdlp_exe_path", self.ytdlpEdit.text().strip())
+        self.settings.setValue("ffmpeg_exe_path", self.ffmpegEdit.text().strip())
         self.settings.setValue("geometry", self.saveGeometry())
         event.accept()
     # ------------------------------------------------------------ UI 槽函数
+    # ------------------------------------------- Cookies Profile（下拉枚举/手动选目录）
+    def _refresh_profile_items(self):
+        """重建 Profile 下拉：默认项 + 自动扫描到的该浏览器 Profile 目录 + 手动浏览项。"""
+        browser = self.cookieCombo.currentText()
+        self.profileCombo.clear()
+        self.profileCombo.addItem("默认（留空 → 自动）", "")
+        for path in list_browser_profiles(browser):
+            self.profileCombo.addItem(path, path)
+        self.profileCombo.addItem("手动选择 Profile 目录…", "__BROWSE__")
+        self.profileCombo.setCurrentIndex(-1)
+
+    def _apply_profile(self, value: str):
+        """把保存的 Profile 值恢复到下拉框：能匹配候选则选中该项，否则按文本填入。"""
+        value = (value or "").strip()
+        if not value:
+            self.profileCombo.setCurrentIndex(0)
+            return
+        for i in range(self.profileCombo.count()):
+            if str(self.profileCombo.itemData(i) or "") == value:
+                self.profileCombo.setCurrentIndex(i)
+                return
+        self.profileCombo.setEditText(value)
+
+    def _profile_value(self) -> str:
+        """当前生效的 Profile 值：''=默认 / Profile 名 / Profile 绝对路径。"""
+        text = self.profileCombo.currentText().strip()
+        idx = self.profileCombo.currentIndex()
+        if 0 <= idx < self.profileCombo.count():
+            if text == self.profileCombo.itemText(idx):
+                data = self.profileCombo.itemData(idx)
+                return "" if data in (None, "__BROWSE__") else str(data)
+        return text
+
+    def _on_profile_activated(self, index: int):
+        """点击下拉中的“手动选择 Profile 目录…”时打开目录选择器。"""
+        if index >= 0 and self.profileCombo.itemData(index) == "__BROWSE__":
+            self._browse_profile_dir()
+
+    def _browse_profile_dir(self):
+        """打开目录选择器，直达该浏览器存放 Profile 的根目录。"""
+        browser = self.cookieCombo.currentText()
+        roots = browser_profile_roots(browser)
+        start = roots[0] if roots else ""
+        if browser == "Firefox":
+            title = "选择 Firefox 的 Profile 目录（Profiles 下的 xxx.default-release 子目录）"
+        else:
+            title = ("选择 Profile 目录（Chrome/Edge/Brave/Vivaldi 为 "
+                     "...\\User Data\\Default 这类含 Cookies 的目录）")
+        path = QFileDialog.getExistingDirectory(self, title, start)
+        if path:
+            self.profileCombo.setEditText(os.path.normpath(path))
+            self.profileCombo.setCurrentIndex(-1)
+            self.append_log("info", f"Cookies Profile 使用目录：{os.path.normpath(path)}")
+
+    def _update_profile_hint(self):
+        """选择 Cookies 来源后，提示该浏览器去哪找 Profile。"""
+        browser = self.cookieCombo.currentText()
+        if self.cookieCombo.currentIndex() <= 0 or browser == "Opera":
+            if browser == "Opera":
+                self.profileHint.setText(
+                    "<b>Opera</b> 不支持指定 Profile，此栏已禁用（可换 Chrome/Edge/Firefox 等）。")
+                self.profileHint.show()
+            else:
+                self.profileHint.hide()
+            return
+        roots = browser_profile_roots(browser)
+        if browser == "Firefox":
+            if roots:
+                tip = ("Firefox 的 Profile 目录通常在：%s"
+                       "（子目录形如 xxx.default-release）。留空 = 自动使用最近使用的 Profile。"
+                       % html.escape(roots[0]))
+            else:
+                tip = ("Firefox 的 Profile 目录默认在 %APPDATA%\\Mozilla\\Firefox\\Profiles"
+                       "（形如 xxx.default-release），当前未检测到；可点下拉的"
+                       "“手动选择 Profile 目录…”指定。")
+        else:
+            if roots:
+                tip = ("通常位于 %s\\Default（多 Profile 时还有 Profile 1、Profile 2…）。"
+                       "留空 = 自动使用默认 Profile。" % html.escape(roots[0]))
+            else:
+                tip = ("未检测到 %s 的 User Data 目录，可点下拉的“手动选择 Profile 目录…”"
+                       "自行指定（需选到含 Cookies 的 Profile 目录）。" % html.escape(browser))
+        self.profileHint.setText(tip)
+        self.profileHint.show()
+
     def _on_cookie_changed(self):
-        # 只有选择了具体浏览器才允许填写 Profile
-        self.profileEdit.setEnabled(self.cookieCombo.currentIndex() > 0)
+        """切换 Cookies 来源：重建 Profile 候选、启用态与“去哪找”提示。"""
+        idx = self.cookieCombo.currentIndex()
+        browser = self.cookieCombo.currentText()
+        can_profile = idx > 0 and browser != "Opera"
+        self._refresh_profile_items()
+        self.profileCombo.setEnabled(can_profile)
+        if not can_profile:
+            self.profileCombo.setEditText("")
+        self._update_profile_hint()
 
     def _on_add_url(self):
         url = self.urlEdit.text().strip()
@@ -318,8 +493,78 @@ class MainWindow(QMainWindow):
             self.outDirEdit.setText(path)
             self.settings.setValue("output_dir", path)
 
+    # ------------------------------------------------------- 外部程序设置
+    def _start_dir(self) -> str:
+        """“浏览”对话框的起始目录：当前已填路径的目录，否则程序所在目录。"""
+        for edit in (self.ytdlpEdit, self.ffmpegEdit):
+            cur = edit.text().strip()
+            if cur and os.path.isfile(cur):
+                return os.path.dirname(os.path.abspath(cur))
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _on_browse_ytdlp(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 yt-dlp.exe（官网下载的独立可执行文件）", self._start_dir(),
+            "可执行文件 (*.exe)")
+        if path:
+            self._set_ytdlp_exe(path)
+
+    def _on_browse_ffmpeg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 ffmpeg.exe（须与 ffprobe.exe 同目录）", self._start_dir(),
+            "可执行文件 (*.exe)")
+        if path:
+            self._set_ffmpeg_exe(path)
+
+    def _set_ytdlp_exe(self, path: str) -> None:
+        """设置外部 yt-dlp.exe 路径（空串 = 恢复内置后端）。设置即校验并持久化。"""
+        path = os.path.abspath(path.strip()) if (path or "").strip() else ""
+        if path and not os.path.isfile(path):
+            self.append_log("warning", f"指定的文件不存在：{path}")
+            return
+        if path:
+            ver = self._ytdlp_ver(path)
+            if not ver:
+                self.append_log("error",
+                                f"无法运行所选文件读取版本，请确认它确实是 yt-dlp.exe：\n{path}")
+                return
+            self.append_log("info", f"yt-dlp.exe 校验通过（v{ver}）：{path}")
+        else:
+            self.append_log("info", "已恢复“内置 yt-dlp 库”后端。")
+        self.ytdlpEdit.setText(path)
+        self.settings.setValue("ytdlp_exe_path", path)
+        self._update_backend_status()
+
+    def _set_ffmpeg_exe(self, path: str) -> None:
+        """设置手动 ffmpeg.exe 路径（空串 = 恢复自动检测）。设置即校验并持久化。"""
+        path = os.path.abspath(path.strip()) if (path or "").strip() else ""
+        if path and not os.path.isfile(path):
+            self.append_log("warning", f"指定的文件不存在：{path}")
+            return
+        if path:
+            sibling = os.path.join(os.path.dirname(path), "ffprobe.exe")
+            if not os.path.isfile(sibling):
+                self.append_log(
+                    "warning", "提示：所选目录里没有 ffprobe.exe，部分合并/探测可能失败；"
+                               "建议选择同时包含 ffmpeg.exe 与 ffprobe.exe 的 bin 目录。")
+            self.append_log("info", f"已指定 ffmpeg：{path}")
+        else:
+            self.append_log("info", "已恢复 ffmpeg 自动检测。")
+        self.ffmpegEdit.setText(path)
+        self.settings.setValue("ffmpeg_exe_path", path)
+        self._update_ffmpeg_status()
+
+    def _ytdlp_ver(self, exe: str) -> str:
+        """读取外部 yt-dlp.exe 版本（带缓存，避免反复启动子进程）。"""
+        if exe not in self._ytdlp_ver_cache:
+            self._ytdlp_ver_cache[exe] = get_ytdlp_version(exe)
+        return self._ytdlp_ver_cache[exe]
+
     def _on_parse_clicked(self):
         """解析 URL（后台线程执行 extract_info，避免卡界面）。"""
+
         if self._busy:
             return
         url = self.urlEdit.text().strip()
@@ -332,13 +577,15 @@ class MainWindow(QMainWindow):
             return
 
         # 主线程里快照所有参数，后台线程绝不直接读 UI 控件
-        cookies_cfg = make_cookies_cfg(self.cookieCombo.currentText(), self.profileEdit.text())
+        cookies_cfg = make_cookies_cfg(self.cookieCombo.currentText(), self._profile_value())
         noplaylist = self.noPlaylistCheck.isChecked()
         is_playlist_url = ("playlist" in url.lower()) or ("list=" in url.lower())
+        ytdlp_exe = self.ytdlpEdit.text().strip() or None   # 外部 yt-dlp.exe（可空）
 
         def task():
             return parse_url(url, cookies_cfg=cookies_cfg,
                              noplaylist=noplaylist,
+                             ytdlp_exe=ytdlp_exe,
                              log_cb=self._worker_log)
 
         self._start_job(task, on_done=self._on_parse_done, cancellable=False)
@@ -421,11 +668,17 @@ class MainWindow(QMainWindow):
             fmt_expr = FORMAT_AUTO_BEST
             fmt_text = "默认：最佳画质"
 
-        cookies_cfg = make_cookies_cfg(self.cookieCombo.currentText(), self.profileEdit.text())
+        cookies_cfg = make_cookies_cfg(self.cookieCombo.currentText(), self._profile_value())
         noplaylist = self.noPlaylistCheck.isChecked()
+        ytdlp_exe = self.ytdlpEdit.text().strip() or None    # 外部 yt-dlp.exe（可空）
+        ffmpeg_exe = self.ffmpegEdit.text().strip() or None  # 手动指定 ffmpeg（可空）
+        if ytdlp_exe:
+            self.append_log("info", "后端：手动指定的外部 yt-dlp.exe（命令行模式）。")
+        else:
+            self.append_log("info", "后端：打包内置的 yt-dlp Python 库。")
         if cookies_cfg:
             self.append_log("info", f"Cookies 来源：{self.cookieCombo.currentText()}"
-                                    f"（Profile: {self.profileEdit.text().strip() or '默认'}）")
+                                    f"（Profile: {self._profile_value() or '默认'}）")
         else:
             self.append_log("info", "Cookies：不使用")
         self.append_log("info", f"队列任务数：{len(urls)}；清晰度：{fmt_text}")
@@ -442,6 +695,8 @@ class MainWindow(QMainWindow):
                 fmt_expr,
                 cookies_cfg,
                 noplaylist=noplaylist,
+                ytdlp_exe=ytdlp_exe,                  # 外部 yt-dlp.exe（可空）
+                ffmpeg_exe=ffmpeg_exe,                # 手动指定 ffmpeg（可空）
                 cancel_event=self._cancel_event,      # 取消事件（线程安全）
                 log_cb=self._worker_log,
                 progress_cb=self._worker_progress,
@@ -559,14 +814,37 @@ class MainWindow(QMainWindow):
             self.progressBar.setValue(1000)
             fn = payload.get("filename") or ""
             self.progressInfo.setText(f"{fn} 下载完成，正在执行合并/后处理……")
+    # ------------------------------------------------ 外部程序与后端状态
+    def _update_backend_status(self):
+        """刷新外部程序设置区底部的“当前 yt-dlp 后端”状态文字。"""
+        exe = self.ytdlpEdit.text().strip()
+        if exe and os.path.isfile(exe):
+            ver = self._ytdlp_ver(exe)
+            detail = html.escape(exe) + (f"，v{html.escape(ver)}" if ver else "")
+            text = ('<span style="color:#0a7d32;font-weight:bold;">✓ 使用外部 yt-dlp</span>'
+                    f'<span style="color:#444;">（{detail}）—— 解析与下载均调用该 exe。</span>')
+        else:
+            text = ('<span style="color:#555;">当前后端：<b>内置 yt-dlp'
+                    f'（v{html.escape(YTDLP_VERSION)}）</b>'
+                    '—— 随程序打包。想用更新版本？在上方浏览选择官方下载的 yt-dlp.exe。</span>')
+        self.backendStatusLabel.setText(text)
+
     # ------------------------------------------------------------ ffmpeg 提示
     def _update_ffmpeg_status(self):
-        """顶部横幅：检测 ffmpeg；未安装时给出清晰的分步安装指引。"""
-        path = find_ffmpeg()
+        """顶部横幅：手动指定优先；其次自动检测；都找不到时给安装指引。"""
+        manual = self.ffmpegEdit.text().strip()
+        path = resolve_ffmpeg(manual or None)
         if path:
+            src = "手动指定" if manual else "自动检测"
             self.ffmpegLabel.setText(
                 f'<span style="color:#0a7d32;font-weight:bold;">✓ ffmpeg 已就绪</span>'
-                f'<span style="color:#444;">（{html.escape(str(path))}）—— 可正常合并音视频。</span>')
+                f'<span style="color:#444;">（{src}：{html.escape(str(path))}）—— 可正常合并音视频。</span>')
+            return
+        if manual:
+            self.ffmpegLabel.setText(
+                '<span style="color:#c00000;font-weight:bold;">⚠ 手动指定的 ffmpeg 不可用</span>'
+                '<span style="color:#7a2000;">（文件已失效或不是有效可执行文件），且自动检测也未找到。'
+                '请在“外部程序路径”里重新指定，或按下方指引安装。</span>')
             return
         # 未检测到 ffmpeg：给出明确的分步安装指引（不依赖 PATH 知识也能照做）
         steps = (
@@ -611,7 +889,9 @@ class MainWindow(QMainWindow):
         """任务运行期间禁用会引发并发冲突的控件。"""
         self._busy = busy
         for w in (self.parseBtn, self.addBtn, self.removeBtn, self.clearBtn,
-                  self.downloadBtn, self.browseBtn):
+                  self.downloadBtn, self.browseBtn,
+                  self.ytdlpBrowseBtn, self.ytdlpClearBtn,
+                  self.ffmpegBrowseBtn, self.ffmpegClearBtn):
             w.setEnabled(not busy)
         self.cancelBtn.setEnabled(busy and cancellable)
 

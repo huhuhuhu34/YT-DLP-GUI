@@ -4,4 +4,10 @@ __pycache__/
 build/
 dist/
 *.spec
+# ---- 回归冒烟脚本 ----
 .smoke_out/
+
+# ---- 测试用外部工具 exe（体积大，勿提交）----
+yt-dlp.exe
+ffmpeg.exe
+ffprobe.exe
