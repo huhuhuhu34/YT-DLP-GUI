@@ -1,22 +1,24 @@
 # YT-DLP GUI —— PySide6 桌面批量下载器
 
-基于 **yt-dlp Python API**（不拼命令行）的 Windows 桌面 GUI：解析清晰度、批量排队、逐条下载，支持 Cookies、进度条与取消。
+基于 **yt-dlp Python API**（不拼命令行）的 Windows 桌面 GUI：解析清晰度、批量排队、逐条下载，支持 Cookies、进度条、取消与应用图标。
 
 ## 文件结构
 
-| 文件 | 说明 |
+| 文件/目录 | 说明 |
 | --- | --- |
 | `main.py` | 程序入口 + 主界面（PySide6）|
 | `worker.py` | QThread 后台任务封装（Worker + 信号）|
 | `downloader.py` | yt-dlp 下载逻辑封装（不依赖 Qt）|
+| `make_icon.py` | 图标生成脚本（需 PySide6，重跑可换图标）|
+| `assets/` | 图标产物：`app.ico`（exe 用）、`app_icon.png`（窗口/任务栏用）|
 | `requirements.txt` | 从源码运行时需要的 Python 依赖 |
-| `build.ps1` | 一键打包脚本（不内置 ffmpeg）|
+| `build.ps1` | 一键打包脚本（不内置 ffmpeg，自动带图标）|
 
 ---
 
 ## 最终用户需要安装的依赖（重要）
 
-打包好的 `YoutubeDlpGUI.exe` 已内置 Python、yt-dlp、PySide6、pycryptodomex，**用户不需要安装 Python**。
+打包好的 `YoutubeDlpGUI.exe` 已内置 Python、yt-dlp、PySide6、pycryptodomex、图标，**用户不需要安装 Python**。
 
 唯一需要用户自行安装的外部依赖是 **ffmpeg**（含 ffprobe.exe）：把“视频流 + 音频流”合并成一个文件、下载 m3u8/HLS 流、格式转换都要用到它。
 
@@ -37,6 +39,7 @@ winget install Gyan.FFmpeg
 3. 二选一：把 bin 目录加入系统 PATH；或把 `ffmpeg.exe`、`ffprobe.exe` 复制到 `YoutubeDlpGUI.exe` 同目录。
 
 **验证**：新开命令行执行 `ffmpeg -version`；然后启动程序，顶部横幅显示绿色“✓ ffmpeg 已就绪”即完成。
+
 > 提示：不装 ffmpeg 也能下载“单文件已含音轨”的格式或纯音频，但默认的“最佳画质（自动合并）”与高清“仅视频流”选项会失败。
 
 ---
@@ -50,6 +53,7 @@ python -m venv .venv
 .\\.venv\\Scripts\\Activate.ps1
 python -m pip install -U pip
 python -m pip install -r requirements.txt   # yt-dlp / PySide6 / pycryptodomex
+python make_icon.py                        # 生成 assets/app.ico 与 app_icon.png
 python main.py
 ```
 
@@ -63,7 +67,7 @@ python main.py
 ## 打包为单文件 exe（不内置 ffmpeg）
 
 ```powershell
-# 一键打包（推荐）：自动使用 .venv，缺 pyinstaller 会自动安装
+# 一键打包（推荐）：自动用 .venv、缺 pyinstaller 自动装、图标自动生成/带上
 .\build.ps1
 ```
 
@@ -73,6 +77,8 @@ python main.py
 .\\.venv\\Scripts\\python -m pip install -U pyinstaller
 .\\.venv\\Scripts\\python -m PyInstaller --noconfirm --clean --onefile --windowed `
     --name "YoutubeDlpGUI" `
+    --icon "assets\app.ico" `
+    --add-data "assets\app_icon.png;assets" `
     --collect-all yt_dlp `
     --hidden-import Cryptodome `
     main.py
@@ -84,9 +90,15 @@ python main.py
 
 - **必须用装好依赖的解释器打包**（推荐 `.venv` 里的 python）。若用没有安装 yt-dlp / PySide6 的全局 Python，PyInstaller 分析阶段会报 `No module named`。
 - **`--collect-all yt_dlp` 必须保留**：yt-dlp 有大量延迟加载的抽取器模块，否则打包后“能启动但一解析就报错”。
-- **不内置 ffmpeg**：这样打包不会因为缺 ffmpeg.exe 而失败，exe 也更小；用户运行前按上文安装 ffmpeg 即可（程序会自动识别 PATH 或 exe 同目录下的 ffmpeg）。
+- **不内置 ffmpeg**：这样打包不会因为缺 ffmpeg.exe 而失败，exe 也更小；用户运行前按上文安装 ffmpeg 即可（程序会自动识别 PATH、winget 安装目录或 exe 同目录下的 ffmpeg）。
 - `--windowed` 无控制台；调试期可去掉该参数观察 yt-dlp 原始输出。
 - 未签名单文件 exe 首次运行易被 Windows SmartScreen / 杀软拦截，正式分发建议加代码签名。
+
+### 更换图标
+
+- 想换风格：修改 `make_icon.py` 里的 `draw_icon()`（或让它加载你自己的 256×256 图片），然后运行 `python make_icon.py` 重新生成；
+- 已有现成图标：直接把你的 `.ico` 覆盖到 `assets/app.ico`、`.png` 覆盖到 `assets/app_icon.png` 即可；
+- 重新执行 `\build.ps1` 打包后，窗口图标与 exe 图标都会一起更新。
 
 ## 其他说明
 

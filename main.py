@@ -13,7 +13,7 @@ import threading
 from datetime import datetime
 
 from PySide6.QtCore import QSettings, Qt, QThread
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QIcon, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -56,6 +56,20 @@ LOG_COLORS = {
     "error": "#c00000",
 }
 
+def icon_path() -> str:
+    """返回应用图标文件的绝对路径（源码运行与打包后均可用）。"""
+    # PyInstaller --add-data 会把 assets/app_icon.png 解压到 _MEIPASS/assets
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+        cand = os.path.join(base, "assets", "app_icon.png")
+        if os.path.isfile(cand):
+            return cand
+    # 源码运行：项目根目录 assets/app_icon.png
+    cand = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "app_icon.png")
+    if os.path.isfile(cand):
+        return cand
+    return ""
+
 APP_STYLE = """
 QPushButton#primaryBtn {
     background: #2f6fed; color: white; font-weight: bold;
@@ -80,6 +94,11 @@ class MainWindow(QMainWindow):
         self._worker: Worker | None = None
         self._cancel_event: threading.Event | None = None
         self._busy = False
+
+        # 窗口/任务栏图标（图标缺失时静默跳过，不影响启动）
+        _ico = icon_path()
+        if _ico:
+            self.setWindowIcon(QIcon(_ico))
 
         self._build_ui()
         self._restore_settings()
