@@ -27,7 +27,9 @@ jobs:
 
       - name: Build exe (reuse build.ps1)
         shell: pwsh
-        run: .\build.ps1   # 内部会自动装 pyinstaller、缺图标时跑 make_icon.py
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+          .\build.ps1   # 内部会自动装 pyinstaller、缺图标时跑 make_icon.py
 
       - name: Smoke test (exe exists & non-empty)
         shell: pwsh
