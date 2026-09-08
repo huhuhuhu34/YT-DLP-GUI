@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # git push origin v1.2.0 即触发
+  workflow_dispatch:  # 同时支持手动按钮触发
+
+permissions:
+  contents: write     # 允许创建 Release / 上传附件（默认 GITHUB_TOKEN 即可）
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build exe (reuse build.ps1)
+        shell: pwsh
+        run: .\build.ps1   # 内部会自动装 pyinstaller、缺图标时跑 make_icon.py
+
+      - name: Smoke test (exe exists & non-empty)
+        shell: pwsh
+        run: |
+          $exe = "dist\YoutubeDlpGUI.exe"
+          if (-not (Test-Path $exe)) { throw "exe not found: $exe" }
+          Write-Host ("exe size = {0:N1} MB" -f ((Get-Item $exe).Length / 1MB))
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/YoutubeDlpGUI.exe   # 自动使用 push 的 tag 名
+          generate_release_notes: true    # 自动根据 commits 生成说明
